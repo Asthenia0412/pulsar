@@ -391,7 +391,11 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
 
         // totalAvailablePermits may be updated by other threads
         int firstAvailableConsumerPermits = getFirstAvailableConsumerPermits();
-        int currentTotalAvailablePermits = Math.max(totalAvailablePermits, firstAvailableConsumerPermits);
+        // Compute the actual sum of per-consumer permits to improve accuracy when consumer count is high.
+        // The volatile totalAvailablePermits counter can lag under high concurrency of FLOW updates.
+        int sumOfConsumerPermits = getSumOfConsumerPermits();
+        int currentTotalAvailablePermits = Math.max(totalAvailablePermits,
+                Math.max(firstAvailableConsumerPermits, sumOfConsumerPermits));
         if (currentTotalAvailablePermits > 0 && firstAvailableConsumerPermits > 0) {
             Pair<Integer, Long> calculateResult = calculateToRead(currentTotalAvailablePermits);
             int messagesToRead = calculateResult.getLeft();
@@ -878,6 +882,13 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
         long totalEntriesProcessed = 0;
         int avgBatchSizePerMsg = remainingMessages > 0 ? Math.max(remainingMessages / entries.size(), 1) : 1;
 
+        // Dynamic round-robin batch size: when there are many consumers, reduce per-consumer
+        // batch so that more consumers get a fair share within a single read pass.
+        // Without this, with dispatcherMaxRoundRobinBatchSize=20 and 500 consumers + 500 entries,
+        // only ~25 consumers receive messages per pass, leaving the rest starving.
+        int effectiveRoundRobinBatchSize = computeEffectiveRoundRobinBatchSize(
+                entries.size(), consumerList.size(), serviceConfig.getDispatcherMaxRoundRobinBatchSize());
+
         // If the dispatcher is closed, firstAvailableConsumerPermits will be 0, which skips dispatching the
         // messages.
         while (entriesToDispatch > 0 && isAtleastOneConsumerAvailable()) {
@@ -893,7 +904,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
 
             int maxEntriesInThisBatch = getMaxEntriesInThisBatch(
                     remainingMessages, c.getMaxUnackedMessages(), c.getUnackedMessages(), avgBatchSizePerMsg,
-                    availablePermits, serviceConfig.getDispatcherMaxRoundRobinBatchSize()
+                    availablePermits, effectiveRoundRobinBatchSize
             );
             int end = Math.min(start + maxEntriesInThisBatch, entries.size());
             List<Entry> entriesForThisConsumer = entries.subList(start, end);
@@ -967,6 +978,32 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
         // pick at least one entry to dispatch
         maxEntriesInThisBatch = Math.max(maxEntriesInThisBatch, 1);
         return maxEntriesInThisBatch;
+    }
+
+    /**
+     * Compute the effective round-robin batch size for a given dispatch pass.
+     * <p>
+     * When the number of consumers exceeds the configured {@code maxRoundRobinBatchSize},
+     * a fixed batch size would starve most consumers in a single read pass. This method
+     * caps the per-consumer batch to {@code ceil(entries / consumers)} so that every
+     * consumer receives a fair share within the same pass, while never exceeding the
+     * configured maximum.
+     *
+     * @param entryCount           number of entries to dispatch in this pass
+     * @param consumerCount        number of active consumers
+     * @param maxRoundRobinBatchSize configured maximum per-consumer batch size
+     * @return effective batch size, always at least 1
+     */
+    @VisibleForTesting
+    static int computeEffectiveRoundRobinBatchSize(int entryCount, int consumerCount,
+                                                   int maxRoundRobinBatchSize) {
+        if (consumerCount <= 0 || entryCount <= 0) {
+            return Math.max(1, maxRoundRobinBatchSize);
+        }
+        // Target: at most ceil(totalEntries / consumerCount) entries per consumer,
+        // but never exceed the configured max. Clamp to at least 1.
+        int targetEntriesPerConsumer = Math.max(1, (entryCount + consumerCount - 1) / consumerCount);
+        return Math.min(maxRoundRobinBatchSize, targetEntriesPerConsumer);
     }
 
     protected boolean addEntryToReplay(Entry entry) {
@@ -1164,6 +1201,24 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
             }
         }
         return 0;
+    }
+
+    /**
+     * Sum of per-consumer available permits across all currently connected consumers.
+     * This provides an accurate, non-racy alternative to the dispatcher-wide volatile
+     * {@code totalAvailablePermits} which can lag under high FLOW concurrency.
+     */
+    protected int getSumOfConsumerPermits() {
+        int sum = 0;
+        if (consumerList.isEmpty() || IS_CLOSED_UPDATER.get(this) == TRUE) {
+            return 0;
+        }
+        for (Consumer consumer : consumerList) {
+            if (consumer != null && !consumer.isBlocked() && consumer.cnx().isActive() && consumer.isWritable()) {
+                sum += consumer.getAvailablePermits();
+            }
+        }
+        return sum;
     }
 
     private boolean isConsumerWritable() {

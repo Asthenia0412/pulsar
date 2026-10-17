@@ -387,4 +387,57 @@ public class PersistentDispatcherMultipleConsumersTest extends SharedPulsarBaseT
         }
         Assert.assertEquals(errors.get(), 0, "No exceptions should occur during concurrent operations");
     }
+
+    @Test
+    public void testComputeEffectiveRoundRobinBatchSize() {
+        // Default batch size = 20
+        int maxBatch = 20;
+
+        // Scenario 1: 10 consumers, 500 entries → ceil(500/10)=50, capped at 20
+        Assert.assertEquals(20, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 10, maxBatch));
+
+        // Scenario 2: 500 consumers, 500 entries → ceil(500/500)=1
+        Assert.assertEquals(1, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 500, maxBatch));
+
+        // Scenario 3: 25 consumers, 500 entries → ceil(500/25)=20, exact match
+        Assert.assertEquals(20, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 25, maxBatch));
+
+        // Scenario 4: 1000 consumers, 500 entries → ceil(500/1000)=1
+        Assert.assertEquals(1, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 1000, maxBatch));
+
+        // Scenario 5: 1 consumer, 500 entries → ceil(500/1)=500, capped at 20
+        Assert.assertEquals(20, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 1, maxBatch));
+
+        // Scenario 6: 100 consumers, 500 entries → ceil(500/100)=5
+        Assert.assertEquals(5, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 100, maxBatch));
+
+        // Scenario 7: 0 consumers → falls back to configured max
+        Assert.assertEquals(20, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 0, maxBatch));
+
+        // Scenario 8: 0 entries → falls back to configured max
+        Assert.assertEquals(20, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(0, 100, maxBatch));
+
+        // Scenario 9: 51 consumers, 500 entries → ceil(500/51)=10
+        Assert.assertEquals(10, PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 51, maxBatch));
+
+        // Verify that with 500 consumers and batch size=1, all 500 consumers are visited
+        // instead of just 25 being visited with batch size=20
+        int consumersServedBefore = 500 / maxBatch;   // 25
+        int consumersServedAfter = 500 / PersistentDispatcherMultipleConsumers
+                .computeEffectiveRoundRobinBatchSize(500, 500, maxBatch);  // 500
+        Assert.assertEquals(25, consumersServedBefore);
+        Assert.assertEquals(500, consumersServedAfter);
+        Assert.assertTrue(consumersServedAfter > consumersServedBefore * 10,
+                "Dynamic batch should serve an order of magnitude more consumers");
+    }
+
 }
